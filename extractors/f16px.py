@@ -5,14 +5,19 @@ import time
 import hashlib
 import os
 import random
+import uuid
 from urllib.parse import urlparse
+
+from Crypto.Hash import SHA256
+from Crypto.PublicKey import ECC
+from Crypto.Signature import DSS
 
 from extractors.base import BaseExtractor, ExtractorError
 from utils import python_aesgcm
 
 
 class F16PxExtractor(BaseExtractor):
-    F16PX_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:138.0) Gecko/20100101 Firefox/138.0"
+    F16PX_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
 
     def __init__(self, request_headers: dict, proxies: list = None):
         super().__init__(request_headers, proxies, extractor_name="f16px")
@@ -27,6 +32,14 @@ class F16PxExtractor(BaseExtractor):
 
     def _join_key_parts(self, parts) -> bytes:
         return b"".join(self._b64url_decode(p) for p in parts)
+
+    @staticmethod
+    def _b64url_encode(value: bytes) -> str:
+        return base64.urlsafe_b64encode(value).rstrip(b"=").decode()
+
+    @classmethod
+    def _int_to_b64url(cls, value) -> str:
+        return cls._b64url_encode(int(value).to_bytes(32, "big"))
 
     @staticmethod
     def _pick_best(sources: list) -> str:
@@ -71,6 +84,70 @@ class F16PxExtractor(BaseExtractor):
 
         return {"fingerprint": fingerprint}
 
+    async def _make_attested_fingerprint(self, origin: str, embed_url: str) -> dict:
+        headers = {
+            "Referer": embed_url,
+            "User-Agent": self.F16PX_USER_AGENT,
+        }
+
+        challenge_resp = await self._make_request(
+            f"{origin}/api/videos/access/challenge",
+            headers=headers,
+            method="POST",
+            retries=1,
+        )
+        challenge = json.loads(challenge_resp.text)
+
+        key = ECC.generate(curve="P-256")
+        digest = SHA256.new(challenge["nonce"].encode())
+        signature = DSS.new(key, "fips-186-3", encoding="binary").sign(digest)
+
+        public_key = {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": self._int_to_b64url(key.pointQ.x),
+            "y": self._int_to_b64url(key.pointQ.y),
+            "ext": True,
+            "key_ops": ["verify"],
+        }
+
+        attest_payload = {
+            "viewer_id": uuid.uuid4().hex,
+            "device_id": uuid.uuid4().hex,
+            "challenge_id": challenge["challenge_id"],
+            "nonce": challenge["nonce"],
+            "signature": self._b64url_encode(signature),
+            "public_key": public_key,
+            "client": {
+                "user_agent": self.F16PX_USER_AGENT,
+                "platform": "Windows",
+                "languages": ["it-IT", "it", "en-US", "en"],
+                "timezone": "Europe/Rome",
+                "hardware_concurrency": 8,
+                "touch_points": 0,
+            },
+            "storage": {},
+            "attributes": {"entropy": "low"},
+        }
+
+        attest_resp = await self._make_request(
+            f"{origin}/api/videos/access/attest",
+            headers={**headers, "Content-Type": "application/json"},
+            method="POST",
+            retries=1,
+            json=attest_payload,
+        )
+        attest = json.loads(attest_resp.text)
+
+        return {
+            "fingerprint": {
+                "token": attest["token"],
+                "viewer_id": attest["viewer_id"],
+                "device_id": attest["device_id"],
+                "confidence": attest["confidence"],
+            }
+        }
+
     def _decrypt_sources(self, pb: dict) -> list:
         iv = self._b64url_decode(pb["iv"])
         key = self._join_key_parts(pb["key_parts"])
@@ -108,7 +185,7 @@ class F16PxExtractor(BaseExtractor):
             "User-Agent": self.F16PX_USER_AGENT,
             "X-Embed-Origin": host,
             "X-Embed-Referer": embed_url,
-            "X-Embed-Parent": origin,
+            "X-Embed-Parent": embed_url,
         })
 
         try:
@@ -117,7 +194,7 @@ class F16PxExtractor(BaseExtractor):
                 headers=headers,
                 method="POST",
                 retries=1,
-                json=self._make_fingerprint_payload()
+                json=await self._make_attested_fingerprint(origin, embed_url)
             )
             data = json.loads(resp.text)
         except json.JSONDecodeError:
@@ -151,7 +228,7 @@ class F16PxExtractor(BaseExtractor):
             raise ExtractorError("F16PX: No sources after decryption")
 
         out_headers = {
-            "referer": f"{origin}/",
+            "referer": embed_url,
             "origin": origin,
             "Accept-Language": "en-US,en;q=0.5",
             "Accept": "*/*",
