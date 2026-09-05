@@ -5,8 +5,24 @@ import threading
 
 logger = logging.getLogger(__name__)
 
-_CONFIG_DIR = os.environ.get("CONFIG_DIR", "/data")
+_VIXSRC_WARP_EXCLUDES = {
+    "vixcloud.cc",
+    "*.vixcloud.cc",
+    "vixsrc.to",
+    "*.vixsrc.to",
+    "*.vix-content.net",
+}
+
+# Docker keeps its persistent volume at /data.  Native Windows runs should
+# keep the same layout inside the EasyProxy checkout instead of writing to
+# the drive root (C:\data).
+_PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+_DEFAULT_CONFIG_DIR = (
+    os.path.join(_PROJECT_DIR, "data") if os.name == "nt" else "/data"
+)
+_CONFIG_DIR = os.environ.get("CONFIG_DIR") or _DEFAULT_CONFIG_DIR
 _CONFIG_FILE = os.path.join(_CONFIG_DIR, "config.json")
+DEFAULT_RECORDINGS_DIR = os.path.join(_CONFIG_DIR, "recordings")
 
 DEFAULT_CONFIG = {
     "enable_warp": False,
@@ -22,8 +38,6 @@ DEFAULT_CONFIG = {
         "torbox.app", "*.torbox.app", "api.torbox.app",
         "offcloud.com", "*.offcloud.com", "api.offcloud.com",
         "put.io", "*.put.io", "api.put.io",
-        "vixcloud.cc", "*.vixcloud.cc", "vixsrc.to", "*.vixsrc.to",
-        "*.vix-content.net",
     ],
     "warp_exclude_domains_custom": [],
     "global_proxies": [],
@@ -33,7 +47,7 @@ DEFAULT_CONFIG = {
     "proxy_off_extractors": [],
     "proxy_exclude_domains": [],
     "dvr_enabled": False,
-    "recordings_dir": "/data/recordings",
+    "recordings_dir": DEFAULT_RECORDINGS_DIR,
     "max_recording_duration": 28800,
     "recordings_retention_days": 7,
     "proxy_test_timeout": 10,
@@ -43,6 +57,22 @@ DEFAULT_CONFIG = {
 
 _lock = threading.Lock()
 _config_data = None
+
+
+def _remove_vixsrc_warp_excludes(config):
+    changed = False
+    for key in ("warp_exclude_domains", "warp_exclude_domains_custom"):
+        values = config.get(key, [])
+        if not isinstance(values, list):
+            continue
+        filtered = [
+            value for value in values
+            if str(value).strip().lower() not in _VIXSRC_WARP_EXCLUDES
+        ]
+        if filtered != values:
+            config[key] = filtered
+            changed = True
+    return changed
 
 
 def _load():
@@ -62,12 +92,16 @@ def _load():
                         if item not in combined:
                             combined.append(item)
                     merged[list_key] = combined
+            config_changed = _remove_vixsrc_warp_excludes(merged)
             _config_data = merged
-            logger.info("Loaded config from %s", _CONFIG_FILE)
+            if config_changed:
+                _save()
+            logger.debug("Loaded config from %s", _CONFIG_FILE)
             return
         except Exception as e:
             logger.warning("Failed to load config.json: %s", e)
     _config_data = dict(DEFAULT_CONFIG)
+    _remove_vixsrc_warp_excludes(_config_data)
     _save()
 
 
@@ -119,6 +153,7 @@ def replace_all(data: dict):
         _load()
     merged = dict(DEFAULT_CONFIG)
     merged.update(data)
+    _remove_vixsrc_warp_excludes(merged)
     with _lock:
         _config_data = merged
     _save()

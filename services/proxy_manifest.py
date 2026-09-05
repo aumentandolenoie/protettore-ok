@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import time
 import urllib.parse
 import aiohttp
@@ -25,10 +26,39 @@ from services.proxy_shared import (
     get_proxy_for_url,
     is_expired_embed_error,
     extractor_name_for_log,
+    get_public_base_url,
+    get_extractor_routing_overrides,
 )
+
+HLS_MEDIA_PLAYLIST_CACHE_MAX = 64
+HLS_MEDIA_PLAYLIST_CACHE_MIN_TTL = 0.5
+HLS_MEDIA_PLAYLIST_CACHE_MAX_TTL = 2.0
+HLS_VOD_PLAYLIST_CACHE_TTL = 30.0
 
 
 class HLSProxyManifestHandlerMixin:
+
+    @staticmethod
+    def _get_media_playlist_cache_ttl(playlist: str) -> float:
+        """Choose a short cache TTL from the generated playlist cadence."""
+        if "#EXT-X-ENDLIST" in playlist:
+            return HLS_VOD_PLAYLIST_CACHE_TTL
+
+        target_duration = None
+        for line in playlist.splitlines():
+            if line.startswith("#EXT-X-TARGETDURATION:"):
+                try:
+                    target_duration = float(line.split(":", 1)[1].strip())
+                except (TypeError, ValueError):
+                    target_duration = None
+                break
+
+        if target_duration is None or target_duration <= 0:
+            return HLS_MEDIA_PLAYLIST_CACHE_MIN_TTL
+        return min(
+            HLS_MEDIA_PLAYLIST_CACHE_MAX_TTL,
+            max(HLS_MEDIA_PLAYLIST_CACHE_MIN_TTL, target_duration / 2),
+        )
 
     async def handle_proxy_request(self, request):
         """Gestisce le richieste proxy principali"""
@@ -59,7 +89,17 @@ class HLSProxyManifestHandlerMixin:
         strict_proxy_token = STRICT_PROXY_CONTEXT.set(bool(selected_proxy))
         force_direct = self._should_force_direct_from_query(request)
         extractor = None
-        extractor_key = None
+        extractor_key = request.query.get("extractor_key")
+
+        # Keep extractor routing policy when a generated relay URL no longer
+        # carries the original warp=/proxy= flags.
+        admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
+        if admin_warp_off:
+            bypass_warp = True
+            BYPASS_WARP_CONTEXT.set(True)
+        if admin_proxy_off:
+            bypass_proxies = True
+            BYPASS_PROXIES_CONTEXT.set(True)
 
         try:
             # --- Gestione URL brevi (Shortened URLs, base64 only) ---
@@ -108,6 +148,19 @@ class HLSProxyManifestHandlerMixin:
                     header_name = param_name[2:]
                     combined_headers[header_name] = param_value
 
+            # DUAL's browser test already resolved the final media URL and its
+            # required headers. Do not run GenericHLSExtractor again: providers
+            # can reject the Referer it guesses even though the raw URL works.
+            if request.query.get("direct_hls") == "1":
+                return await self._proxy_stream(
+                    request,
+                    target_url,
+                    combined_headers,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=selected_proxy,
+                    force_direct=force_direct,
+                )
+
             extractor_key = None
             captured_manifest = None
             is_rewritten_hls_segment = request.path.startswith("/proxy/hls/segment.")
@@ -131,6 +184,29 @@ class HLSProxyManifestHandlerMixin:
                 stream_key = request.query.get("stream_key")
             else:
                 extractor = await self.get_extractor(target_url, combined_headers, bypass_warp=bypass_warp)
+
+                # The first resolver call identifies the extractor. Apply its
+                # admin routing policy before the actual extraction, then use a
+                # routing-specific cached extractor instance.
+                extractor_key = self._extractor_key_for_instance(extractor)
+                admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
+                routing_changed = False
+                if admin_warp_off and not bypass_warp:
+                    bypass_warp = True
+                    BYPASS_WARP_CONTEXT.set(True)
+                    routing_changed = True
+                if admin_proxy_off and not bypass_proxies:
+                    bypass_proxies = True
+                    BYPASS_PROXIES_CONTEXT.set(True)
+                    routing_changed = True
+                if routing_changed:
+                    selected_proxy = None
+                    SELECTED_PROXY_CONTEXT.set(None)
+                    STRICT_PROXY_CONTEXT.set(False)
+                    extractor = await self.get_extractor(
+                        target_url, combined_headers, bypass_warp=bypass_warp
+                    )
+                    extractor_key = self._extractor_key_for_instance(extractor)
 
                 # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
                 # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
@@ -157,6 +233,17 @@ class HLSProxyManifestHandlerMixin:
                 captured_manifests = result.get("captured_manifests") or {}
                 force_disable_ssl = result.get("disable_ssl", False)
                 force_direct = result.get("force_direct", force_direct)
+
+                # Re-apply the admin policy after extraction as well: an
+                # extractor result must not remove warp=off/proxy=off before
+                # the manifest and segment URLs are generated.
+                admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
+                if admin_warp_off:
+                    bypass_warp = True
+                    BYPASS_WARP_CONTEXT.set(True)
+                if admin_proxy_off:
+                    bypass_proxies = True
+                    BYPASS_PROXIES_CONTEXT.set(True)
 
                 # Cattura e sanifica il proxy per evitare double-encoding (%253A -> %3A)
                 raw_proxy = request.query.get("proxy") or result.get("selected_proxy")
@@ -203,9 +290,7 @@ class HLSProxyManifestHandlerMixin:
 
             # --- DASH NATIVO: Riscrive il manifest per segmenti proxati (senza conversione) ---
             if is_native_mpd:
-                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-                host = request.headers.get("X-Forwarded-Host", request.host)
-                proxy_base = f"{scheme}://{host}"
+                proxy_base = get_public_base_url(request)
 
                 # Fetch original manifest if not already captured
                 if not captured_manifest:
@@ -250,9 +335,7 @@ class HLSProxyManifestHandlerMixin:
             # Se redirect_stream è False, restituisci il JSON con i dettagli (stile MediaFlow)
             if not redirect_stream:
                 # Costruisci l'URL base del proxy
-                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-                host = request.headers.get("X-Forwarded-Host", request.host)
-                proxy_base = f"{scheme}://{host}"
+                proxy_base = get_public_base_url(request)
 
                 mediaflow_endpoint = (
                     result.get("mediaflow_endpoint", "hls_proxy")
@@ -281,6 +364,10 @@ class HLSProxyManifestHandlerMixin:
                     q_params["extractor_key"] = extractor_key
                 if 'stream_key' in locals() and stream_key:
                     q_params["stream_key"] = stream_key
+                if bypass_warp:
+                    q_params["warp"] = "off"
+                if bypass_proxies:
+                    q_params["proxy"] = "off"
 
                 response_data = {
                     "destination_url": stream_url,
@@ -292,9 +379,7 @@ class HLSProxyManifestHandlerMixin:
                 return web.json_response(response_data)
 
             if captured_manifest and request.path.endswith("manifest.m3u8"):
-                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-                host = request.headers.get("X-Forwarded-Host", request.host)
-                proxy_base = f"{scheme}://{host}"
+                proxy_base = get_public_base_url(request)
                 original_channel_url = request.query.get("orig_url") or request.query.get("url") or request.query.get("d", "")
                 api_password = request.query.get("api_password")
                 no_bypass = request.query.get("no_bypass") == "1"
@@ -362,6 +447,40 @@ class HLSProxyManifestHandlerMixin:
             # (e.g. "dashinripe" in URL being mistaken for a DASH manifest).
             is_mpd = ".mpd" in stream_url.lower() or "/dash/" in stream_url.lower()
             if is_mpd:
+                requested_rep_id = request.query.get("rep_id")
+                playlist_cache_key = None
+                if requested_rep_id:
+                    # Hash the complete request URL so credentials/tokens are
+                    # not retained as cache keys in memory or diagnostics.
+                    playlist_cache_key = hashlib.sha256(
+                        str(request.rel_url).encode("utf-8")
+                    ).hexdigest()
+                    playlist_cache = getattr(self, "_hls_playlist_cache", None)
+                    if playlist_cache is None:
+                        playlist_cache = {}
+                        self._hls_playlist_cache = playlist_cache
+
+                    now = time.monotonic()
+                    for cache_key, cache_entry in list(playlist_cache.items()):
+                        if cache_entry[0] <= now:
+                            playlist_cache.pop(cache_key, None)
+
+                    cached_playlist = playlist_cache.get(playlist_cache_key)
+                    if cached_playlist:
+                        logger.debug(
+                            "[HLS cache] hit: rep_id=%s age=%.2fs",
+                            requested_rep_id,
+                            now - cached_playlist[1],
+                        )
+                        return web.Response(
+                            text=cached_playlist[2],
+                            content_type="application/vnd.apple.mpegurl",
+                            headers={
+                                "Access-Control-Allow-Origin": "*",
+                                "Cache-Control": "no-cache",
+                            },
+                        )
+
                 # Convert MPD to HLS with server-side decryption
                 logger.info(
                     f"🔄 [Legacy Mode] Converting MPD to HLS: {stream_url}"
@@ -459,11 +578,7 @@ class HLSProxyManifestHandlerMixin:
                      return web.Response(text="Failed to fetch MPD manifest after all attempts", status=502)
 
                 # Build proxy base URL
-                scheme = request.headers.get(
-                    "X-Forwarded-Proto", request.scheme
-                )
-                host = request.headers.get("X-Forwarded-Host", request.host)
-                proxy_base = f"{scheme}://{host}"
+                proxy_base = get_public_base_url(request)
 
                 # Build params string with headers
                 params = "".join(
@@ -519,6 +634,31 @@ class HLSProxyManifestHandlerMixin:
                     # Use final_mpd_url (after redirects) for segment URL construction
                     hls_content = converter.convert_master_playlist(
                         manifest_content, proxy_base, final_mpd_url, params
+                    )
+
+                if playlist_cache_key:
+                    self._register_segment_prefetch_chain(hls_content)
+                    playlist_cache = getattr(self, "_hls_playlist_cache", None)
+                    if playlist_cache is None:
+                        playlist_cache = {}
+                        self._hls_playlist_cache = playlist_cache
+                    now = time.monotonic()
+                    playlist_cache_ttl = self._get_media_playlist_cache_ttl(hls_content)
+                    playlist_cache[playlist_cache_key] = (
+                        now + playlist_cache_ttl,
+                        now,
+                        hls_content,
+                    )
+                    for cache_key, cache_entry in list(playlist_cache.items()):
+                        if cache_entry[0] <= now:
+                            playlist_cache.pop(cache_key, None)
+                    while len(playlist_cache) > HLS_MEDIA_PLAYLIST_CACHE_MAX:
+                        playlist_cache.pop(next(iter(playlist_cache)), None)
+                    logger.debug(
+                        "[HLS cache] stored: rep_id=%s ttl=%.1fs entries=%d",
+                        rep_id,
+                        playlist_cache_ttl,
+                        len(playlist_cache),
                     )
 
                 return web.Response(
@@ -601,8 +741,12 @@ class HLSProxyManifestHandlerMixin:
             is_not_found = "404" in error_msg or "not found" in error_msg
             is_temporary_error = any(
                 x in error_msg
-                for x in ["403", "forbidden", "502", "bad gateway", "timeout", "connection", "temporarily unavailable"]
-            )
+                for x in [
+                    "403", "forbidden", "502", "bad gateway", "timeout", "connection",
+                    "temporarily unavailable", "no usable proxy route",
+                    "no proxy route available", "direct fallback disabled",
+                ]
+            ) or type(e).__name__ == "ExtractorError"
             is_corrupt = "corrupt" in error_msg or "not available" in error_msg
             extractor_name = extractor_name_for_log(extractor)
 

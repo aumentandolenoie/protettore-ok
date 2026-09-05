@@ -14,13 +14,11 @@ logging.basicConfig(
 # Aggiungi path corrente per import moduli
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-_IS_PROCESS_POOL_WORKER = __name__ == "__mp_main__"
-
-if not _IS_PROCESS_POOL_WORKER:
-    from services.proxy import HLSProxy
-    from config import PORT, RECORDINGS_DIR, APP_VERSION
-    from services.recording_manager import RecordingManager
-    from routes.recordings import setup_recording_routes
+from services.proxy import HLSProxy
+from config import PORT, RECORDINGS_DIR, APP_VERSION, start_memory_profiler
+from services.dual import service as dual_service
+from services.recording_manager import RecordingManager
+from routes.recordings import setup_recording_routes
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +30,17 @@ def _read_file(path):
 # --- Logica di Avvio ---
 def create_app():
     """Crea e configura l'applicazione aiohttp."""
+    dual_cache_dir = os.path.join(RECORDINGS_DIR, "dual_data")
     proxy = HLSProxy()
 
-    app = web.Application()
+    # DUAL is part of the main EasyProxy process; there is no child aiohttp app.
+    app = web.Application(
+        middlewares=[dual_service.dual_middleware],
+        client_max_size=4 * 1024 * 1024,
+    )
     app['proxy'] = proxy
+    app['dual_service'] = dual_service
+    dual_service.install(app, dual_cache_dir)
 
     # Initialize recording manager for DVR functionality
     recording_manager = RecordingManager(
@@ -61,6 +66,8 @@ def create_app():
     app.router.add_get('/url-generator', proxy.handle_url_generator)
     app.router.add_get('/info', proxy.handle_info_page)
     app.router.add_get('/api/info', proxy.handle_api_info)
+    app.router.add_get('/api/memory/profile', proxy.handle_memory_profile)
+    app.router.add_post('/api/memory/profile/reset', proxy.handle_memory_profile_reset)
     app.router.add_get('/key', proxy.handle_key_request)
     app.router.add_get('/proxy/manifest.m3u8', proxy.handle_proxy_request)
     app.router.add_get('/proxy/hls/manifest.m3u8', proxy.handle_proxy_request)
@@ -107,6 +114,13 @@ def create_app():
     app.router.add_get('/proxy/ip', proxy.handle_proxy_ip)
     # ✅ Health check endpoint
     app.router.add_get('/health', lambda r: web.json_response({"status": "ok", "version": APP_VERSION}))
+    app.router.add_get('/api/dual/memory', dual_service.handle_memory)
+    # Backward-compatible alias for existing monitoring clients.
+    app.router.add_get('/api/sidecar/memory', dual_service.handle_memory)
+
+    app.router.add_post('/dual/sync/links', proxy.handle_dual_sync_links)
+    app.router.add_get('/dual/menifest.m3u8', proxy.handle_dual_server_m3u8)
+    app.router.add_get('/dual/manifest.m3u8', proxy.handle_dual_server_m3u8)
 
     # Admin Panel
     app.router.add_get('/admin', proxy.handle_admin)
@@ -132,8 +146,9 @@ def create_app():
     app.on_cleanup.append(cleanup_handler)
     
     async def on_startup(app):
-        await proxy.start_tasks()
-        recording_manager.start_cleanup_loop()
+        start_memory_profiler()
+        asyncio.create_task(proxy.start_tasks())
+        asyncio.create_task(recording_manager.cleanup_loop())
     app.on_startup.append(on_startup)
 
     async def on_shutdown(app):
@@ -142,9 +157,8 @@ def create_app():
     
     return app
 
-# I worker PoW di ProcessPoolExecutor su Windows importano il modulo principale
-# come __mp_main__. Non devono inizializzare server, registry e database.
-app = None if _IS_PROCESS_POOL_WORKER else create_app()
+# Crea l'istanza "privata" dell'applicazione aiohttp.
+app = create_app()
 
 def main():
     """Funzione principale per avviare il server."""

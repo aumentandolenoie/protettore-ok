@@ -44,10 +44,12 @@ def get_curl_async_session():
     return AsyncSession
 
 import config as _config
+import config_store as _config_store
 from config import (
     get_proxy_for_url,
     get_ssl_setting_for_url,
     get_connector_for_proxy,
+    get_curl_ipv4_options,
     API_PASSWORD,
     check_password,
     get_client_ip,
@@ -98,6 +100,20 @@ _STDLIB_MODULES = {
 class ProxyDeadRetryError(Exception):
     """Raised when the proxy dies during playlist fetch; triggers re-extraction."""
 
+def get_public_base_url(request):
+    """Build the public origin, preserving HTTPS behind reverse proxies."""
+    cf_visitor = request.headers.get("CF-Visitor", "").lower()
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+    scheme = forwarded_proto.split(",", 1)[0].strip().lower() or request.scheme
+    if '"scheme"' in cf_visitor and "https" in cf_visitor:
+        scheme = "https"
+    if scheme not in {"http", "https"}:
+        scheme = request.scheme
+
+    forwarded_host = request.headers.get("X-Forwarded-Host", "")
+    host = forwarded_host.split(",", 1)[0].strip() or request.host
+    return f"{scheme}://{host}"
+
 def hex_to_b64url(hex_str: str) -> str:
     return (
         base64.urlsafe_b64encode(binascii.unhexlify(hex_str))
@@ -136,6 +152,24 @@ def parse_clearkey_params(request) -> str | None:
 
 def seal_clearkey(clearkey: str) -> str:
     return seal_state({"clearkey": clearkey}, "clearkey")
+
+
+def get_extractor_routing_overrides(extractor_key: str | None) -> tuple[bool, bool]:
+    """Return admin WARP/proxy bypass flags for an extractor relay chain."""
+    key = str(extractor_key or "").strip().lower()
+    if not key:
+        return False, False
+
+    base_key = key.replace("_direct", "").replace("_noproxy", "")
+
+    def configured(name: str) -> set[str]:
+        values = _config_store.get(name, [])
+        return {str(value).strip().lower() for value in values if value}
+
+    return (
+        base_key in configured("warp_off_extractors"),
+        base_key in configured("proxy_off_extractors"),
+    )
 
 def check_vavoo_request(headers: dict, request: web.Request, url: str) -> bool:
     return (

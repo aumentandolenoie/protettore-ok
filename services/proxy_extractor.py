@@ -9,6 +9,8 @@ from services.proxy_shared import (
     STRICT_PROXY_CONTEXT,
     check_vavoo_request,
     ManifestRewriter,
+    get_public_base_url,
+    get_extractor_routing_overrides,
 )
 import config_store
 import asyncio
@@ -99,6 +101,7 @@ class HLSProxyExtractorHandlerMixin:
                         "vavoo",
                         "vixsrc",
                         "vixcloud (alias of vixsrc)",
+                        "ads",
                         "sportsonline",
                         "mixdrop",
                         "voe",
@@ -128,10 +131,10 @@ class HLSProxyExtractorHandlerMixin:
                         "raiplay",
                     ],
                     "examples": [
-                        f"{request.scheme}://{request.host}/extractor/video?d=https://vavoo.to/channel/123",
-                        f"{request.scheme}://{request.host}/extractor/video.m3u8?host=vavoo&d=https://custom-link.com",
-                        f"{request.scheme}://{request.host}/extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ",
-                        f"{request.scheme}://{request.host}/extractor/video?d=BASE64_STRING",
+                        f"{get_public_base_url(request)}/extractor/video?d=https://vavoo.to/channel/123",
+                        f"{get_public_base_url(request)}/extractor/video.m3u8?host=vavoo&d=https://custom-link.com",
+                        f"{get_public_base_url(request)}/extractor/video.mp4?host=mixdrop&d=https://mixdrop.co/e/ABC123XYZ",
+                        f"{get_public_base_url(request)}/extractor/video?d=BASE64_STRING",
                     ],
                 }
                 return web.json_response(help_response)
@@ -185,9 +188,9 @@ class HLSProxyExtractorHandlerMixin:
             if extractor_key:
                 base_key = extractor_key.replace("_direct", "").replace("_noproxy", "")
                 
-                # Check warp off. embedst skips WARP by default (it needs direct/non-WARP routing).
+                # Check WARP-off extractor policy.
                 warp_off_list = config_store.get("warp_off_extractors", [])
-                if base_key in warp_off_list or base_key == "embedst":
+                if base_key in warp_off_list:
                     bypass_warp = True
                     BYPASS_WARP_CONTEXT.set(True)
                     logger.debug(f"WARP off for extractor: {base_key}")
@@ -198,7 +201,7 @@ class HLSProxyExtractorHandlerMixin:
                     BYPASS_PROXIES_CONTEXT.set(True)
                     logger.debug(f"Proxy off for extractor: {base_key}")
                     
-                if base_key in warp_off_list or base_key in proxy_off_list or base_key == "embedst":
+                if base_key in warp_off_list or base_key in proxy_off_list:
                     if extractor_key and extractor_key in self.extractors:
                         _old = self.extractors.pop(extractor_key, None)
                         self._extractor_atimes.pop(extractor_key, None)
@@ -253,6 +256,18 @@ class HLSProxyExtractorHandlerMixin:
             force_direct = result.get("force_direct", False)
             bypass_warp = result.get("bypass_warp", bypass_warp)
 
+            # The extractor may return its own routing fields (VidFast's
+            # runner does not know about the admin toggle). Never let that
+            # result clear an admin-enforced bypass before building the relay.
+            admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
+            if admin_warp_off:
+                bypass_warp = True
+                BYPASS_WARP_CONTEXT.set(True)
+                if _shared.WARP_PROXY_URL and selected_proxy == _shared.WARP_PROXY_URL:
+                    selected_proxy = None
+            if admin_proxy_off:
+                BYPASS_PROXIES_CONTEXT.set(True)
+
             logger.debug(f"Extractor Debug: Extractor result selected_proxy: {selected_proxy}")
 
             # Log dello stato dell'estrattore
@@ -268,13 +283,7 @@ class HLSProxyExtractorHandlerMixin:
             )
 
             # Costruisci l'URL del proxy per questo stream
-            cf_visitor = request.headers.get("CF-Visitor", "")
-            if '"scheme"' in cf_visitor and "https" in cf_visitor.lower():
-                scheme = "https"
-            else:
-                scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-            host = request.headers.get("X-Forwarded-Host", request.host)
-            proxy_base = f"{scheme}://{host}"
+            proxy_base = get_public_base_url(request)
 
             # Determina l'endpoint corretto
             endpoint = "/proxy/hls/manifest.m3u8"
@@ -419,6 +428,10 @@ class HLSProxyExtractorHandlerMixin:
                 q_params["api_password"] = api_password
             if selected_proxy:
                 q_params["proxy"] = selected_proxy
+            if bypass_warp:
+                q_params["warp"] = "off"
+            if BYPASS_PROXIES_CONTEXT.get():
+                q_params["proxy"] = "off"
             if extractor_key:
                 q_params["extractor_key"] = extractor_key
             if stream_key:

@@ -5,6 +5,8 @@ import os
 import shutil
 from typing import Any
 
+from config import get_preferred_proxy_for_url
+import config as _cfg
 from extractors.base import BaseExtractor, ExtractorError
 logger = logging.getLogger(__name__)
 
@@ -53,7 +55,25 @@ class EmbedStExtractor(BaseExtractor):
         if not os.path.exists(_RUNNER):
             raise ExtractorError(f"EmbedSt: runner script not found at {_RUNNER}")
 
+        bypass_warp = bool(kwargs.get("bypass_warp") or self.bypass_warp_active)
+        self.bypass_warp_active = bypass_warp
+        proxy = await get_preferred_proxy_for_url(
+            url, "embedst", self.proxies, bypass_warp
+        )
+        if proxy is None and not _cfg.is_direct_connection_allowed(bypass_warp):
+            raise ExtractorError(
+                "EmbedSt: direct fallback disabled; no proxy route available"
+            )
+        if proxy and not str(proxy).lower().startswith(("http://", "https://")):
+            raise ExtractorError(
+                f"EmbedSt: selected route is not supported by the Node resolver ({proxy}); refusing direct fallback"
+            )
+
         env = dict(os.environ)
+        if proxy:
+            env["EMBEDST_PROXY"] = str(proxy)
+        else:
+            env.pop("EMBEDST_PROXY", None)
         if kwargs.get("background_refresh") or kwargs.get("force_refresh"):
             env["EMBEDST_DEBUG"] = "1"
 
@@ -152,17 +172,41 @@ class EmbedStExtractor(BaseExtractor):
         logger.info("EmbedSt: streamed.pk -> %s", resolved[:80])
         return resolved
 
-    async def _get_curl_session(self):
+    async def _get_curl_session(self, curl_options=None):
         """Get or create a persistent curl_cffi session."""
         if self._curl_session is None:
             from curl_cffi import AsyncSession
-            self._curl_session = AsyncSession(impersonate="chrome124")
+            self._curl_session = AsyncSession(
+                impersonate="chrome124",
+                curl_options=curl_options or {},
+            )
+        else:
+            # curl_cffi accepts curl_options on the session, not on .get().
+            self._curl_session.curl_options = curl_options or {}
         return self._curl_session
 
     async def _fetch_manifest(self, url: str, headers: dict) -> str | None:
+        proxy = await get_preferred_proxy_for_url(
+            url, "embedst", self.proxies, self.bypass_warp_active
+        )
+        if proxy is None and not _cfg.is_direct_connection_allowed(self.bypass_warp_active):
+            raise ExtractorError(
+                "EmbedSt: direct fallback disabled; no proxy route available"
+            )
+        request_kwargs = {}
+        curl_options = None
+        if proxy:
+            request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            curl_options = _cfg.get_curl_ipv4_options(proxy).get("curl_options")
         try:
-            s = await self._get_curl_session()
-            resp = await s.get(url, headers=headers, timeout=20, allow_redirects=True)
+            s = await self._get_curl_session(curl_options)
+            resp = await s.get(
+                url,
+                headers=headers,
+                timeout=20,
+                allow_redirects=True,
+                **request_kwargs,
+            )
             if resp.status_code == 200:
                 return resp.text
             logger.debug("EmbedSt manifest fetch curl_cffi status %s", resp.status_code)

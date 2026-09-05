@@ -10,6 +10,7 @@ from curl_cffi.requests import AsyncSession
 from nacl.secret import SecretBox
 
 from config import get_preferred_proxy_for_url
+import config as _cfg
 from extractors.base import ExtractorError
 
 logger = logging.getLogger(__name__)
@@ -144,16 +145,26 @@ class VidLinkExtractor:
             "Referer": "https://vidlink.pro/",
             "X-Playback-Environment": "dash-hevc",
         }
+        bypass_warp = bool(kwargs.get("bypass_warp"))
         proxy = await get_preferred_proxy_for_url(
-            api_url, self.extractor_name, self.proxies, kwargs.get("bypass_warp")
+            api_url, self.extractor_name, self.proxies, bypass_warp
         )
+        if proxy is None and not _cfg.is_direct_connection_allowed(bypass_warp):
+            raise ExtractorError(
+                "VidLink: direct fallback disabled; no proxy route available"
+            )
         request_kwargs = {}
+        curl_options = None
         if proxy:
             proxy = self._normalize_proxy_url(proxy)
             request_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            curl_options = _cfg.get_curl_ipv4_options(proxy).get("curl_options")
 
         try:
-            async with AsyncSession(impersonate="chrome124") as session:
+            async with AsyncSession(
+                impersonate="chrome124",
+                curl_options=curl_options,
+            ) as session:
                 response = await session.get(
                     api_url, headers=headers, timeout=30, **request_kwargs
                 )

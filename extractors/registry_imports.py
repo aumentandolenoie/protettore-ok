@@ -44,9 +44,11 @@ VidXgoExtractor = None
 EmbedStExtractor = None
 VidSonicExtractor = None
 VidLinkExtractor = None
+VidFastExtractor = None
 MediasetExtractor = None
 WittyTVExtractor = None
 RaiPlayExtractor = None
+ADSExtractor = None
 
 
 # Importazione condizionale degli estrattori
@@ -238,6 +240,13 @@ except Exception as e:
     VidLinkExtractor = None
 
 try:
+    from extractors.vidfast import VidFastExtractor
+    logger.info("✅ VidFastExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ VidFastExtractor failed to load: %s", e)
+    VidFastExtractor = None
+
+try:
     from extractors.mediaset import MediasetExtractor, WittyTVExtractor
     logger.info("✅ MediasetExtractor and WittyTVExtractor modules loaded.")
 except Exception as e:
@@ -251,6 +260,13 @@ try:
 except Exception as e:
     logger.warning("⚠️ RaiPlayExtractor failed to load: %s", e)
     RaiPlayExtractor = None
+
+try:
+    from extractors.ads import ADSExtractor
+    logger.info("✅ ADSExtractor module loaded.")
+except Exception as e:
+    logger.warning("⚠️ ADSExtractor failed to load: %s", e)
+    ADSExtractor = None
 
 
 __all__ = [
@@ -284,7 +300,9 @@ __all__ = [
     "EmbedStExtractor",
     "VidSonicExtractor",
     "VidLinkExtractor",
+    "VidFastExtractor",
     "MediasetExtractor",
     "WittyTVExtractor",
     "RaiPlayExtractor",
+    "ADSExtractor",
 ]

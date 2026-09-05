@@ -14,11 +14,18 @@ from services.proxy_shared import (
     logger, web, APP_VERSION,
     check_password, get_client_ip, PlaylistBuilder, ClientSession, ClientTimeout,
     TCPConnector, ProxyConnector, get_connector_for_proxy, API_PASSWORD,
+    get_public_base_url,
 )
 from extractors.registry import *
 import config_store
 import config as _config
-from config import reload_config, clear_proxy_affinity, get_system_stats
+from config import (
+    reload_config,
+    clear_proxy_affinity,
+    get_system_stats,
+    get_memory_profile,
+    reset_memory_profiler,
+)
 
 class HLSProxyPagesMixin:
 
@@ -31,10 +38,8 @@ class HLSProxyPagesMixin:
 
         try:
             url_param = request.query.get("url")
-
             if not url_param:
                 return web.Response(text="Missing 'url' parameter", status=400)
-
             if not url_param.strip():
                 return web.Response(text="'url' parameter cannot be empty", status=400)
 
@@ -46,23 +51,34 @@ class HLSProxyPagesMixin:
                     text="No valid playlist definition found", status=400
                 )
 
-            # ✅ CORREZIONE: Rileva lo schema e l'host corretti quando dietro un reverse proxy
-            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-            host = request.headers.get("X-Forwarded-Host", request.host)
-            base_url = f"{scheme}://{host}"
+            base_url = get_public_base_url(request)
 
             # ✅ FIX: Passa api_password al builder se presente
             api_password = request.query.get("api_password")
 
-            async def generate_response():
-                async for (
-                    line
-                ) in self.playlist_builder.async_generate_combined_playlist(
-                    playlist_definitions, base_url, api_password=api_password
-                ):
-                    yield line.encode("utf-8")
+            # Genera e raccoglie completamente la playlist in memoria prima di
+            # rispondere, invece di inviarla in streaming (chunked) chunk per
+            # chunk. Alcuni client a valle (es. Cloudflare Worker + APTV)
+            # restano bloccati in attesa su risposte StreamResponse/chunked,
+            # mentre gestiscono correttamente una risposta bufferizzata con
+            # Content-Length. La logica di generazione/riscrittura degli URL
+            # non cambia.
+            #
+            # Ottimizzazione memoria: invece di accumulare stringhe in una
+            # lista e poi fare "".join(...) + .encode("utf-8") (che tiene in
+            # memoria contemporaneamente lista di stringhe + stringa unita +
+            # buffer bytes finale, cioè fino a 3 copie parziali), si accumula
+            # direttamente in un bytearray man mano che le righe arrivano.
+            # Questo mantiene un'unica struttura che cresce in place, con un
+            # picco di memoria inferiore per playlist molto grandi.
+            buf = bytearray()
+            async for line in self.playlist_builder.async_generate_combined_playlist(
+                playlist_definitions, base_url, api_password=api_password
+            ):
+                buf.extend(line.encode("utf-8"))
 
-            response = web.StreamResponse(
+            return web.Response(
+                body=bytes(buf),
                 status=200,
                 headers={
                     "Content-Type": "application/vnd.apple.mpegurl",
@@ -70,14 +86,6 @@ class HLSProxyPagesMixin:
                     "Access-Control-Allow-Origin": "*",
                 },
             )
-
-            await response.prepare(request)
-
-            async for chunk in generate_response():
-                await response.write(chunk)
-
-            await response.write_eof()
-            return response
 
         except (ConnectionResetError, OSError) as e:
             logger.info(f"Playlist download interrupted (client disconnected): {e}")
@@ -257,6 +265,7 @@ class HLSProxyPagesMixin:
                 "✅ Playlist building",
                 "✅ Supporto Proxy (SOCKS5, HTTP/S)",
                 "✅ Multi-extractor support",
+                "✅ DUAL video + audio sync with VLC HLS master",
                 "✅ CORS enabled",
             ],
             "extractors_loaded": list(self.extractors.keys()),
@@ -278,8 +287,14 @@ class HLSProxyPagesMixin:
                     for s in getattr(self, '_proxy_sessions', {}).values()
                     if s and not s.closed and hasattr(s, '_connector') and hasattr(s._connector, '_conns')
                 ),
+                "parallel_fetch": dict(getattr(self, "_parallel_fetch_stats", {})),
             },
-            "memory": stats.get("proxy_ram", {}),
+            "memory": {
+                **stats.get("proxy_ram", {}),
+                "tracemalloc": stats.get("tracemalloc", {}),
+                "processes": stats.get("processes", {}),
+                "asyncio_tasks": stats.get("asyncio_tasks", {}),
+            },
             "modules": {
                 "playlist_builder": PlaylistBuilder is not None,
                 "vavoo_extractor": VavooExtractor is not None,
@@ -308,6 +323,16 @@ class HLSProxyPagesMixin:
                 "/license": "Proxy licenze DRM (ClearKey/Widevine) - ?url=<URL> o ?clearkey=<id:key>",
                 "/info": "Pagina HTML con informazioni sul server",
                 "/api/info": "Endpoint JSON con informazioni sul server",
+                "/api/memory/profile": "Profiler tracemalloc: allocazioni Python e crescita dal boot",
+                "/api/memory/profile/reset": "POST: resetta il baseline del profiler",
+                "/api/dual/memory": "RAM used by the integrated DUAL service",
+                "/dual/menifest.m3u8": "DUAL HLS master with synchronized video + audio - ?d=<Base64 JSON>",
+                "/dual/manifest.m3u8": "Correctly spelled alias for the DUAL HLS master - ?d=<Base64 JSON>",
+                "/dual/sync/links": "DUAL JSON test for synchronizing video and audio",
+                "/dual/cache/status": "Checks only whether the DUAL offset exists in the shared MongoDB cache",
+                "/dual/aud/{hid}/audio.m3u8": "Synchronized DUAL audio playlist",
+                "/dual/aud/{hid}/init.mp4": "DUAL audio init segment",
+                "/dual/aud/{hid}/s{idx}.m4s": "DUAL audio segment",
             },
             "usage_examples": {
                 "proxy_hls": "/proxy/hls/manifest.m3u8?d=https://example.com/stream.m3u8",
@@ -315,13 +340,26 @@ class HLSProxyPagesMixin:
                 "aes_key": "/key?key_url=https://server.com/key.bin",  # ✅ NUOVO
                 "playlist": "/playlist?url=http://example.com/playlist1.m3u8;http://example.com/playlist2.m3u8",
                 "custom_headers": "/proxy/hls/manifest.m3u8?d=<URL>&h_Authorization=Bearer%20token",
+                "dual_hls": "/dual/menifest.m3u8?d=<Base64URL(JSON)> [&api_password=<PASSWORD>]",
             },
         }
         return web.json_response(info)
 
+    async def handle_memory_profile(self, request):
+        """Return top Python allocations and growth since the profiler baseline."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(get_memory_profile(request.query.get("limit", 30)))
+
+    async def handle_memory_profile_reset(self, request):
+        """Reset the tracemalloc baseline used by the memory profiler."""
+        if not check_password(request):
+            return web.Response(status=401, text="Unauthorized: Invalid API Password")
+        return web.json_response(reset_memory_profiler())
+
     async def handle_openapi(self, request):
         """Espone una specifica OpenAPI minimale per Swagger/ReDoc."""
-        server_url = f"{request.scheme}://{request.host}"
+        server_url = get_public_base_url(request)
         requires_password = bool(API_PASSWORD)
 
         security_schemes = {
@@ -341,15 +379,57 @@ class HLSProxyPagesMixin:
             "info": {
                 "title": "EasyProxy API",
                 "version": version,
-                "description": (
-                    "Interactive documentation for EasyProxy. "
-                    "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
-                    "playlist generation, admin API, DVR/recording management, "
-                    "and compatibility endpoints inspired by MediaFlow Proxy."
+                    "description": (
+                        "Interactive documentation for EasyProxy. "
+                        "Includes HLS/MPD proxying, extractor endpoints, key and license helpers, "
+                        "playlist generation, admin API, DVR/recording management, "
+                        "DUAL video/audio synchronization with VLC HLS master generation, "
+                        "and compatibility endpoints inspired by MediaFlow Proxy."
                 ),
             },
             "servers": [{"url": server_url}],
-            "components": {"securitySchemes": security_schemes},
+            "components": {
+                "securitySchemes": security_schemes,
+                "schemas": {
+                    "DualSource": {
+                        "type": "object",
+                        "description": "Direct URL or extractor source. Use url for a direct manifest, or extractor + d for an extractor page.",
+                        "properties": {
+                            "url": {"type": "string", "format": "uri"},
+                            "extractor": {"type": "string", "example": "vixsrc"},
+                            "d": {"type": "string", "format": "uri"},
+                            "headers": {"type": "object", "additionalProperties": {"type": "string"}},
+                            "warp_off": {"type": "boolean", "default": False},
+                            "proxy_off": {"type": "boolean", "default": False},
+                            "proxy": {"type": "string", "description": "Optional forced proxy URL or off."},
+                        },
+                    },
+                    "DualSyncRequest": {
+                        "type": "object",
+                        "required": ["video", "audio", "audio_lang"],
+                        "properties": {
+                            "video": {"$ref": "#/components/schemas/DualSource"},
+                            "audio": {"$ref": "#/components/schemas/DualSource"},
+                            "audio_lang": {
+                                "type": "string",
+                                "description": "HLS LANGUAGE code or NAME alias.",
+                                "enum": ["ita", "eng", "spa", "fra", "deu", "hin", "rus", "it", "en", "es", "fr", "de", "hi", "ru"],
+                                "example": "ita",
+                            },
+                            "resolution": {"type": "integer", "enum": [720, 1080, 1440, 2160], "description": "Optional override. Omit it to select the highest available video quality automatically.", "example": 2160},
+                            "bypass_audio_language": {"type": "boolean", "default": False, "description": "When true, ignore a language mismatch and use the DEFAULT or best available audio track."},
+                            "reference_audio_url": {"type": "string", "format": "uri"},
+                            "media_key": {"type": "string"},
+                            "video_fingerprint": {"type": "string"},
+                        },
+                        "example": {
+                            "video": {"url": "https://info.movieboxnoob.cc/playlist/ZgRENwVpICUbvjgdTAAjvA.m3u8"},
+                            "audio": {"extractor": "vixsrc", "d": "https://vixsrc.to/movie/1339713/"},
+                            "audio_lang": "ita",
+                        },
+                    },
+                },
+            },
             "paths": {
 
                 # --- System & Public ---
@@ -359,6 +439,106 @@ class HLSProxyPagesMixin:
                         "summary": "Server information",
                         "description": "Returns server status, loaded extractors, modules, and example endpoints.",
                         "responses": {"200": {"description": "Server information JSON"}},
+                    }
+                },
+                "/api/dual/memory": {
+                    "get": {
+                        "summary": "DUAL memory usage",
+                        "description": "Returns RSS used by the in-process DUAL service and its active audio tracks.",
+                        "responses": {
+                            "200": {"description": "DUAL memory usage JSON"},
+                            "401": {"description": "Invalid API password"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/menifest.m3u8": {
+                    "get": {
+                        "summary": "DUAL HLS master",
+                        "description": "Builds one HLS master containing a selected video and an extracted, synchronized audio track. The video is always served through EasyProxy's HLS proxy. The d parameter is URL-safe Base64 JSON. The endpoint is intentionally named menifest for compatibility.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "required": True, "schema": {"type": "string"}, "description": "URL-safe Base64 JSON DualSyncRequest payload."},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {
+                            "200": {"description": "Combined HLS master playlist", "content": {"application/vnd.apple.mpegurl": {"schema": {"type": "string"}}}},
+                            "400": {"description": "Invalid Base64 JSON descriptor or source"},
+                            "401": {"description": "Invalid API password"},
+                            "409": {"description": "Synchronization unavailable; JSON error response"},
+                            "502": {"description": "Extraction or upstream failure"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/manifest.m3u8": {
+                    "get": {
+                        "summary": "DUAL HLS master (correct alias)",
+                        "description": "Alias of /dual/menifest.m3u8 with the correctly spelled manifest path.",
+                        "parameters": [
+                            {"name": "d", "in": "query", "required": True, "schema": {"type": "string"}, "description": "URL-safe Base64 JSON DualSyncRequest payload."},
+                            {"name": "api_password", "in": "query", "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Combined HLS master playlist"}, "400": {"description": "Invalid descriptor or unavailable audio; JSON error response"}, "401": {"description": "Invalid API password"}, "409": {"description": "Synchronization unavailable; JSON error response"}, "502": {"description": "Extraction or upstream failure"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/sync/links": {
+                    "post": {
+                        "summary": "Sync direct or extracted video/audio links",
+                        "description": "Resolves the two sources, selects the requested HLS audio language/NAME alias, prepares audio in memory, calculates the offset, and returns the synchronized result as JSON.",
+                        "requestBody": {
+                            "required": True,
+                            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/DualSyncRequest"}}},
+                        },
+                        "responses": {
+                            "200": {"description": "Synchronization result"},
+                            "400": {"description": "Invalid source or language"},
+                            "401": {"description": "Invalid API password"},
+                            "409": {"description": "Synchronization failed"},
+                            "502": {"description": "Extraction or upstream failure"},
+                        },
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/audio.m3u8": {
+                    "get": {
+                        "summary": "Serve synchronized audio playlist",
+                        "description": "Returns the generated fragmented MP4 audio playlist with the requested offset and playback rate.",
+                        "parameters": [
+                            {"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}},
+                            {"name": "o", "in": "query", "schema": {"type": "integer", "default": 0}, "description": "Offset in milliseconds."},
+                            {"name": "r", "in": "query", "schema": {"type": "integer", "default": 1000000000}, "description": "Playback rate in nano-units."},
+                            {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}},
+                        ],
+                        "responses": {"200": {"description": "Audio HLS playlist"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/init.mp4": {
+                    "get": {
+                        "summary": "Serve audio fragmented MP4 init",
+                        "description": "Returns the initialization fragment for the active DUAL audio track.",
+                        "parameters": [{"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}}, {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "MP4 initialization fragment"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/aud/{hid}/s{idx}.m4s": {
+                    "get": {
+                        "summary": "Serve audio fragmented MP4 segment",
+                        "description": "Returns one active DUAL audio segment after applying the requested offset/rate.",
+                        "parameters": [{"name": "hid", "in": "path", "required": True, "schema": {"type": "string"}}, {"name": "idx", "in": "path", "required": True, "schema": {"type": "integer"}}, {"name": "o", "in": "query", "schema": {"type": "integer"}}, {"name": "r", "in": "query", "schema": {"type": "integer"}}, {"name": "t", "in": "query", "required": True, "schema": {"type": "string"}}],
+                        "responses": {"200": {"description": "Audio segment"}, "401": {"description": "Invalid DUAL session"}, "410": {"description": "Audio session expired"}},
+                        **({"security": security} if requires_password else {}),
+                    }
+                },
+                "/dual/cache/status": {
+                    "post": {
+                        "summary": "Check cached DUAL offset",
+                        "description": "Returns only whether the requested video/audio offset exists in the shared MongoDB cache. Audio is not exposed as a persistent cache.",
+                        "requestBody": {"required": True, "content": {"application/json": {"schema": {"type": "object"}}}},
+                        "responses": {"200": {"description": "Offset cache status JSON"}, "400": {"description": "Missing media key, resolution or fingerprint"}, "401": {"description": "Invalid API password"}},
+                        **({"security": security} if requires_password else {}),
                     }
                 },
                 "/health": {
@@ -900,9 +1080,7 @@ class HLSProxyPagesMixin:
             generated_urls = []
 
             # Determina base URL del proxy
-            scheme = request.headers.get("X-Forwarded-Proto", request.scheme)
-            host = request.headers.get("X-Forwarded-Host", request.host)
-            proxy_base = f"{scheme}://{host}"
+            proxy_base = get_public_base_url(request)
 
             for item in urls_to_process:
                 dest_url = item.get("destination_url")
