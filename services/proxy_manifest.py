@@ -3,6 +3,7 @@ import hashlib
 import time
 import urllib.parse
 import aiohttp
+import config as _config
 import services.proxy_shared as _shared
 from services.proxy_shared import (
     logger,
@@ -28,6 +29,8 @@ from services.proxy_shared import (
     extractor_name_for_log,
     get_public_base_url,
     get_extractor_routing_overrides,
+    request_log_context,
+    safe_log_route,
 )
 
 HLS_MEDIA_PLAYLIST_CACHE_MAX = 64
@@ -85,6 +88,14 @@ class HLSProxyManifestHandlerMixin:
             selected_proxy = urllib.parse.unquote(raw_proxy)
             if "://" not in selected_proxy and "%3a" in selected_proxy.lower():
                 selected_proxy = urllib.parse.unquote(selected_proxy)
+        if selected_proxy and _config.is_warp_proxy_url(selected_proxy) and (
+            bypass_warp or not _config._get_dynamic_warp_enabled()
+        ):
+            logger.debug(
+                "Ignoring stale WARP proxy from relay URL: %s",
+                selected_proxy,
+            )
+            selected_proxy = None
         proxy_token = SELECTED_PROXY_CONTEXT.set(selected_proxy)
         strict_proxy_token = STRICT_PROXY_CONTEXT.set(bool(selected_proxy))
         force_direct = self._should_force_direct_from_query(request)
@@ -161,7 +172,8 @@ class HLSProxyManifestHandlerMixin:
                     force_direct=force_direct,
                 )
 
-            extractor_key = None
+            extractor_key = request.query.get("extractor_key")
+            stream_key = request.query.get("stream_key")
             captured_manifest = None
             is_rewritten_hls_segment = request.path.startswith("/proxy/hls/segment.")
             if is_rewritten_hls_segment:
@@ -180,15 +192,15 @@ class HLSProxyManifestHandlerMixin:
                     }:
                         continue
                     stream_headers[header_name] = header_value
-                extractor_key = request.query.get("extractor_key")
-                stream_key = request.query.get("stream_key")
             else:
                 extractor = await self.get_extractor(target_url, combined_headers, bypass_warp=bypass_warp)
 
                 # The first resolver call identifies the extractor. Apply its
                 # admin routing policy before the actual extraction, then use a
                 # routing-specific cached extractor instance.
-                extractor_key = self._extractor_key_for_instance(extractor)
+                resolved_key = self._extractor_key_for_instance(extractor)
+                if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
+                    extractor_key = resolved_key or extractor_key
                 admin_warp_off, admin_proxy_off = get_extractor_routing_overrides(extractor_key)
                 routing_changed = False
                 if admin_warp_off and not bypass_warp:
@@ -206,7 +218,9 @@ class HLSProxyManifestHandlerMixin:
                     extractor = await self.get_extractor(
                         target_url, combined_headers, bypass_warp=bypass_warp
                     )
-                    extractor_key = self._extractor_key_for_instance(extractor)
+                    resolved_key = self._extractor_key_for_instance(extractor)
+                    if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
+                        extractor_key = resolved_key or extractor_key
 
                 # ✅ FIX CRITICO: Forza l'aggiornamento degli header dell'estrattore.
                 # Siccome gli estrattori vengono memorizzati in self.extractors (cache),
@@ -224,8 +238,10 @@ class HLSProxyManifestHandlerMixin:
                     bypass_warp=bypass_warp,
                     proxy=request.query.get("proxy")
                 )
-                extractor_key = self._extractor_key_for_instance(extractor)
-                stream_key = self._stream_key_for_url(request.query.get("orig_url") or target_url)
+                resolved_key = self._extractor_key_for_instance(extractor)
+                if not extractor_key or (resolved_key and not resolved_key.startswith("generic")):
+                    extractor_key = resolved_key or extractor_key
+                stream_key = stream_key or self._stream_key_for_url(request.query.get("orig_url") or target_url)
                 bypass_warp = result.get("bypass_warp", bypass_warp)
                 stream_url = result["destination_url"]
                 stream_headers = result.get("request_headers", {})
@@ -269,6 +285,14 @@ class HLSProxyManifestHandlerMixin:
                             "Ignoring stale WARP _session_proxy from extractor because bypass_warp=True"
                         )
                         selected_proxy = None
+                    if selected_proxy and _config.is_warp_proxy_url(selected_proxy) and (
+                        bypass_warp or not _config._get_dynamic_warp_enabled()
+                    ):
+                        logger.debug(
+                            "Ignoring stale WARP route after policy reload: %s",
+                            selected_proxy,
+                        )
+                        selected_proxy = None
 
                 # ✅ FIX: Resetta SELECTED_PROXY_CONTEXT al valore effettivo.
                 # get_preferred_proxy_for_url (chiamato dall'estrattore in _get_session)
@@ -300,27 +324,50 @@ class HLSProxyManifestHandlerMixin:
                     try:
                         async with mpd_session.get(stream_url, headers=stream_headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                             if resp.status != 200:
+                                logger.error(
+                                    "❌ Failed to fetch original MPD: status=%s [%s]",
+                                    resp.status,
+                                    request_log_context(
+                                        request,
+                                        stream_url,
+                                        route=safe_log_route(mpd_proxy_used),
+                                        extractor=extractor,
+                                    ),
+                                )
                                 return web.Response(text=f"Failed to fetch original MPD: {resp.status}", status=resp.status)
                             captured_manifest = await resp.text()
                             stream_url = str(resp.url)
                     finally:
-                        if mpd_proxy_used:
+                        if mpd_session and not mpd_session.closed:
                             await mpd_session.close()
 
-                # Encode DASH routing state into base64 token (stateless, no server-side session)
-                from services.proxy_dash import _encode_dash_state
-                session_id = _encode_dash_state(
-                    stream_url.rsplit('/', 1)[0] + '/',
-                    stream_headers,
-                    clearkey=parse_clearkey_params(request)
-                )
+                if "indexRange" in captured_manifest:
+                    try:
+                        from utils.dash_ranges import expand_segment_bases, fetch_range
+                        async def _fetch_sidx(url, range_str):
+                            session, _ = await self._get_proxy_session(
+                                url, bypass_warp=bypass_warp, forced_proxy=selected_proxy
+                            )
+                            try:
+                                return await fetch_range(session, url, stream_headers, range_str)
+                            finally:
+                                if session and not session.closed:
+                                    await session.close()
+                        captured_manifest = await expand_segment_bases(captured_manifest, stream_url, _fetch_sidx)
+                    except Exception as e:
+                        logger.warning(f"Failed to expand DASH SegmentBase indexes: {e}")
 
                 rewritten_mpd = ManifestRewriter.rewrite_mpd_native(
                     manifest_content=captured_manifest,
                     mpd_url=stream_url,
                     proxy_base=proxy_base,
                     stream_headers=stream_headers,
-                    session_id=session_id
+                    clearkey_param=parse_clearkey_params(request),
+                    bypass_warp=bypass_warp,
+                    bypass_proxies=bypass_proxies,
+                    forced_proxy=selected_proxy,
+                    extractor_key=extractor_key,
+                    stream_key=stream_key,
                 )
 
                 return web.Response(
@@ -483,7 +530,8 @@ class HLSProxyManifestHandlerMixin:
 
                 # Convert MPD to HLS with server-side decryption
                 logger.info(
-                    f"🔄 [Legacy Mode] Converting MPD to HLS: {stream_url}"
+                    "🔄 [Legacy Mode] Converting MPD to HLS [%s]",
+                    request_log_context(request, stream_url, extractor=extractor),
                 )
 
                 if MPDToHLSConverter is None:
@@ -510,10 +558,18 @@ class HLSProxyManifestHandlerMixin:
                         mpd_session, mpd_proxy = await self._get_proxy_session(
                             stream_url, bypass_warp=bypass_warp, forced_proxy=selected_proxy
                         )
-                        if mpd_proxy:
-                            logger.info(
-                                f"📡 [MPD] Attempt {attempt+1}/{retries} via proxy: {mpd_proxy}"
-                            )
+                        logger.info(
+                            "📡 [MPD] Attempt %s/%s via %s [%s]",
+                            attempt + 1,
+                            retries,
+                            safe_log_route(mpd_proxy),
+                            request_log_context(
+                                request,
+                                stream_url,
+                                route=safe_log_route(mpd_proxy),
+                                extractor=extractor,
+                            ),
+                        )
 
                         async with mpd_session.get(
                             stream_url,
@@ -524,11 +580,28 @@ class HLSProxyManifestHandlerMixin:
                             # Capture final URL after redirects
                             final_mpd_url = str(resp.url)
                             if final_mpd_url != stream_url:
-                                logger.info(f"↪️ MPD redirected to: {final_mpd_url}")
+                                logger.info(
+                                    "↪️ MPD redirected [%s]",
+                                    request_log_context(
+                                        request,
+                                        final_mpd_url,
+                                        route=safe_log_route(mpd_proxy),
+                                        extractor=extractor,
+                                    ),
+                                )
 
                             if resp.status != 200:
                                 error_text = await resp.text()
-                                logger.error(f"❌ Failed to fetch MPD (Status {resp.status}) at {stream_url}")
+                                logger.error(
+                                    "❌ Failed to fetch MPD: status=%s [%s]",
+                                    resp.status,
+                                    request_log_context(
+                                        request,
+                                        stream_url,
+                                        route=safe_log_route(mpd_proxy),
+                                        extractor=extractor,
+                                    ),
+                                )
                                 if attempt == retries - 1:
                                     return web.Response(
                                         text=f"Failed to fetch MPD: {resp.status}\nResponse: {error_text[:1000]}",
@@ -547,7 +620,18 @@ class HLSProxyManifestHandlerMixin:
                             is_proxy = True
 
                         err_type = "Proxy" if is_proxy else "Timeout"
-                        logger.warning(f"⚠️ [MPD] {err_type} error at attempt {attempt+1}: {e}")
+                        logger.warning(
+                            "⚠️ [MPD] %s error at attempt %s: %s [%s]",
+                            err_type,
+                            attempt + 1,
+                            e,
+                            request_log_context(
+                                request,
+                                stream_url,
+                                route=safe_log_route(mpd_proxy),
+                                extractor=extractor,
+                            ),
+                        )
 
                         # Mark local proxy as dead if it failed
                         if mpd_proxy and "127.0.0.1" in mpd_proxy:
@@ -555,26 +639,54 @@ class HLSProxyManifestHandlerMixin:
                                 mpd_proxy,
                                 extractor_key=request.query.get("extractor_key"),
                             )
+                        if mpd_proxy:
+                            # A pooled SOCKS connector can remain open while
+                            # WireProxy's tunnel is stale. Reusing it for the
+                            # retry only repeats the same timeout; force the
+                            # next attempt to create a fresh route session.
+                            await self._invalidate_proxy_session(mpd_proxy)
                         # Clear sticky context if it's a proxy error
                         if is_proxy and SELECTED_PROXY_CONTEXT.get() and not STRICT_PROXY_CONTEXT.get():
                             logger.info("   [MPD] Clearing sticky proxy context due to ProxyError")
                             SELECTED_PROXY_CONTEXT.set(None)
 
                         if attempt < retries - 1:
-                            logger.info("   [MPD] Retrying...")
+                            logger.info(
+                                "   [MPD] Retrying [%s]",
+                                request_log_context(
+                                    request,
+                                    stream_url,
+                                    route=safe_log_route(mpd_proxy),
+                                    extractor=extractor,
+                                ),
+                            )
                             await asyncio.sleep(1)
                         else:
                             return web.Response(text=f"MPD unreachable: {e}", status=502)
                     except Exception as e:
-                        logger.error(f"❌ [MPD] Unexpected error at attempt {attempt+1}: {e}")
+                        logger.error(
+                            "❌ [MPD] Unexpected error at attempt %s: %s [%s]",
+                            attempt + 1,
+                            e,
+                            request_log_context(
+                                request,
+                                stream_url,
+                                route=safe_log_route(mpd_proxy),
+                                extractor=extractor,
+                            ),
+                        )
                         if attempt == retries - 1:
                             return web.Response(text=f"Unexpected error fetching MPD: {e}", status=500)
                         await asyncio.sleep(1)
                     finally:
-                        if mpd_session and mpd_proxy:
+                        if mpd_session and not mpd_session.closed:
                             await mpd_session.close()
 
                 if manifest_content is None:
+                     logger.error(
+                         "❌ Failed to fetch MPD manifest after all attempts [%s]",
+                         request_log_context(request, stream_url, extractor=extractor),
+                     )
                      return web.Response(text="Failed to fetch MPD manifest after all attempts", status=502)
 
                 # Build proxy base URL
@@ -613,6 +725,10 @@ class HLSProxyManifestHandlerMixin:
                     params += "&warp=off"
                 if bypass_proxies:
                     params += "&proxy=off"
+                if extractor_key:
+                    params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+                if stream_key:
+                    params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
 
                 # Check if requesting specific representation
                 rep_id = request.query.get("rep_id")
@@ -671,7 +787,7 @@ class HLSProxyManifestHandlerMixin:
                 )
 
             # Procedi con il proxy dello stream (passando l'eventuale bypass_warp attivato dall'estrattore e il proxy selezionato)
-            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp, forced_proxy=selected_proxy, force_direct=force_direct)
+            return await self._proxy_stream(request, stream_url, stream_headers, bypass_warp=bypass_warp, forced_proxy=selected_proxy, force_direct=force_direct, extractor_key=extractor_key, stream_key=stream_key)
 
         except ProxyDeadRetryError:
             if getattr(request, '_extraction_retried', False):
@@ -712,28 +828,37 @@ class HLSProxyManifestHandlerMixin:
                     if not selected_proxy2 and original_proxy:
                         new_proxy = get_proxy_for_url(stream_url2, bypass_warp=bypass_warp)
                         if new_proxy and new_proxy != original_proxy:
-                            logger.info("Rotating to new proxy: %s", new_proxy)
+                            logger.info(
+                                "Rotating to new proxy: %s [%s]",
+                                safe_log_route(new_proxy),
+                                request_log_context(
+                                    request,
+                                    stream_url2,
+                                    route=safe_log_route(new_proxy),
+                                    extractor=extractor2,
+                                ),
+                            )
                             selected_proxy2 = new_proxy
                         else:
                             selected_proxy2 = original_proxy
                             force_direct2 = False
-                    logger.info("Re-extraction success: %s", stream_url2[:80])
-                    return await self._proxy_stream(request, stream_url2, stream_headers2, bypass_warp=bypass_warp, forced_proxy=selected_proxy2, force_direct=force_direct2)
+                    logger.info(
+                        "Re-extraction success [%s]",
+                        request_log_context(
+                            request,
+                            stream_url2,
+                            route=safe_log_route(selected_proxy2),
+                            extractor=extractor2,
+                        ),
+                    )
+                    return await self._proxy_stream(request, stream_url2, stream_headers2, bypass_warp=bypass_warp, forced_proxy=selected_proxy2, force_direct=force_direct2, extractor_key=extractor_key, stream_key=stream_key)
                 except Exception as retry_err:
-                    logger.error("Re-extraction failed: %s", retry_err)
+                    logger.error(
+                        "Re-extraction failed: %s [%s]",
+                        retry_err,
+                        request_log_context(request, target_url, extractor=extractor),
+                    )
                     return web.Response(text="Re-extraction failed", status=502)
-                finally:
-                    _ek2 = self._extractor_key_for_instance(extractor2) if extractor2 else None
-                    if _ek2 and _ek2 in self.extractors:
-                        self.extractors.pop(_ek2, None)
-                        self._extractor_atimes.pop(_ek2, None)
-                        for _sr in [r for r in self._extractor_stream_atimes if r[0] == _ek2]:
-                            self._extractor_stream_atimes.pop(_sr, None)
-                    if extractor2 and hasattr(extractor2, "close"):
-                        try:
-                            await extractor2.close()
-                        except Exception:
-                            pass
 
         except Exception as e:
             error_msg = str(e).lower()
@@ -749,38 +874,59 @@ class HLSProxyManifestHandlerMixin:
             ) or type(e).__name__ == "ExtractorError"
             is_corrupt = "corrupt" in error_msg or "not available" in error_msg
             extractor_name = extractor_name_for_log(extractor)
+            raw_log_proxy = request.query.get("proxy") or (
+                getattr(extractor, "last_used_proxy", None)
+                or getattr(extractor, "selected_proxy", None)
+                or getattr(extractor, "_session_proxy", None)
+                or getattr(extractor, "session_proxy", None)
+            )
+            if raw_log_proxy and str(raw_log_proxy).lower() == "off":
+                raw_log_proxy = None
+            error_context = request_log_context(
+                request,
+                target_url,
+                route=safe_log_route(raw_log_proxy),
+                extractor=extractor,
+            )
 
             if is_expired_embed:
-                logger.info("Expired VixSrc embed URL rejected: %s", str(e))
+                logger.info(
+                    "Expired VixSrc embed URL rejected: %s [%s]",
+                    e,
+                    error_context,
+                )
                 return web.Response(text=str(e), status=410)
             if is_corrupt:
-                logger.warning(f"⚠️ {extractor_name}: Content is corrupt or not available - {str(e)}")
+                logger.warning(
+                    "⚠️ %s: Content is corrupt or not available - %s [%s]",
+                    extractor_name,
+                    e,
+                    error_context,
+                )
                 return web.Response(text=f"Content corrupt or not available: {str(e)}", status=404)
             if is_not_found:
-                logger.warning(f"🔍 {extractor_name}: Content not found (404) - {str(e)}")
+                logger.warning(
+                    "🔍 %s: Content not found (404) - %s [%s]",
+                    extractor_name,
+                    e,
+                    error_context,
+                )
                 return web.Response(text=f"Content not found: {str(e)}", status=404)
             if is_temporary_error:
-                logger.warning(f"📡 {extractor_name}: Service temporarily unavailable - {str(e)}")
+                logger.warning(
+                    "📡 %s: Service temporarily unavailable - %s [%s]",
+                    extractor_name,
+                    e,
+                    error_context,
+                )
                 return web.Response(text=f"Service temporarily unavailable: {str(e)}", status=503)
 
-            logger.critical(f"❌ Critical error with {extractor_name} [{target_url}]: {e}")
-            logger.exception(f"Error in proxy request [{target_url}]: {str(e)}")
+            logger.critical("❌ Critical error: %s [%s]", e, error_context)
+            logger.exception("Error in proxy request [%s]", error_context)
             return web.Response(text=f"Proxy error: {str(e)}", status=500)
         finally:
             BYPASS_WARP_CONTEXT.reset(token)
             BYPASS_PROXIES_CONTEXT.reset(proxy_bypass_token)
             SELECTED_PROXY_CONTEXT.reset(proxy_token)
             STRICT_PROXY_CONTEXT.reset(strict_proxy_token)
-            # 🚫 Cache disabilitata: chiudi sempre l'estrattore dopo l'uso.
-            if extractor_key is None and extractor is not None:
-                extractor_key = self._extractor_key_for_instance(extractor)
-            if extractor_key and extractor_key in self.extractors:
-                self.extractors.pop(extractor_key, None)
-                self._extractor_atimes.pop(extractor_key, None)
-                for _sr in [r for r in self._extractor_stream_atimes if r[0] == extractor_key]:
-                    self._extractor_stream_atimes.pop(_sr, None)
-            if extractor and hasattr(extractor, "close"):
-                try:
-                    await extractor.close()
-                except Exception:
-                    pass
+            # Shared extractor lifecycle belongs to the registry owner.

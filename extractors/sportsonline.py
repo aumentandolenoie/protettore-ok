@@ -65,6 +65,7 @@ class SportsonlineExtractor:
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         }
         self.session = None
+        self._route_sessions = {}
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = proxies or _cfg.GLOBAL_PROXIES
         self._session_proxy = None
@@ -169,14 +170,13 @@ class SportsonlineExtractor:
                 "Sportsonline: direct fallback disabled; no proxy route available"
             )
 
+        self.session = self._route_sessions.get(proxy)
+        self._session_proxy = proxy
         if (
             self.session is None
             or self.session.closed
             or self._session_proxy != proxy
         ):
-            if self.session and not self.session.closed:
-                await self.session.close()
-
             timeout = ClientTimeout(total=60, connect=30, sock_read=30)
 
             if proxy:
@@ -192,6 +192,7 @@ class SportsonlineExtractor:
                 cookie_jar=aiohttp.CookieJar(),
             )
             self._session_proxy = proxy
+            self._route_sessions[proxy] = self.session
         return self.session
 
     async def _make_robust_request(
@@ -212,20 +213,34 @@ class SportsonlineExtractor:
                     return html, str(response.url)
 
             except (ssl.SSLError, ClientOSError) as e:
-                logger.warning(f"SSL/OS error attempt {attempt + 1} for {url}: {str(e)}")
+                logger.warning(
+                    "SSL/OS error attempt %s/%s for %s via %s: %s: %r",
+                    attempt + 1,
+                    retries,
+                    url,
+                    self._session_proxy or "direct",
+                    type(e).__name__,
+                    e,
+                )
                 if self._session_proxy:
                     logger.info(f"SSL/OS error with proxy {self._session_proxy}, retrying without direct fallback...")
-                    if self.session and not self.session.closed:
-                        await self.session.close()
-                    self.session = None
-                    self._session_proxy = None
+                    # Keep the shared session alive for concurrent requests.
+                    # aiohttp removes the failed connection from its pool.
                 if attempt < retries - 1:
                     await asyncio.sleep(initial_delay)
                 else:
                     raise ExtractorError(f"All request attempts failed for {url}: {str(e)}")
 
             except Exception as e:
-                logger.warning(f"Request attempt {attempt + 1} failed for {url}: {str(e)}")
+                logger.warning(
+                    "Request attempt %s/%s failed for %s via %s: %s: %r",
+                    attempt + 1,
+                    retries,
+                    url,
+                    self._session_proxy or "direct",
+                    type(e).__name__,
+                    e,
+                )
                 if attempt < retries - 1:
                     await asyncio.sleep(initial_delay)
                 else:
@@ -494,9 +509,11 @@ class SportsonlineExtractor:
             raise ExtractorError(f"Extraction failed: {str(e)}")
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-            self.session = None
+        for session in self._route_sessions.values():
+            if not session.closed:
+                await session.close()
+        self._route_sessions.clear()
+        self.session = None
 
 
 def extract_unpack(packed_js):
