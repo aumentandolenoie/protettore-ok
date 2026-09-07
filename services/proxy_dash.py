@@ -105,9 +105,18 @@ class HLSProxyDashMixin:
                 or "\\" in decoded_path or urlparse(decoded_path).scheme
                 or any(part in (".", "..") for part in decoded_path.split("/"))):
             return web.Response(status=400, text="Invalid DASH segment path")
-        segment_url = urljoin(base_url, path)
-        if getattr(request, "query_string", ""):
-            segment_url += "?" + request.query_string
+        resource_url = routing.get("resource_url")
+        if resource_url:
+            parsed_resource = urlparse(resource_url)
+            if parsed_resource.scheme not in {"http", "https"} or not parsed_resource.netloc:
+                return web.Response(status=400, text="Invalid DASH resource URL")
+            segment_url = resource_url
+        else:
+            # Backward compatibility for tokens generated before resource_url
+            # was sealed into the state.
+            segment_url = urljoin(base_url, path)
+            if getattr(request, "query_string", ""):
+                segment_url += "?" + request.query_string
 
         # Parse clearkey into KID and KEY for decrypter
         kid, key = None, None
@@ -152,10 +161,13 @@ class HLSProxyDashMixin:
             if hasattr(self, "_touch_extractor_activity"):
                 self._touch_extractor_activity(extractor_key, routing.get("stream_key"))
 
-            _session, _ = await self._get_proxy_session(
-                segment_url, bypass_warp=bypass_warp,
-                forced_proxy=forced_proxy,
-            )
+            session_kwargs = {
+                "bypass_warp": bypass_warp,
+                "forced_proxy": forced_proxy,
+            }
+            if routing.get("stream_key"):
+                session_kwargs["session_key"] = routing["stream_key"]
+            _session, _ = await self._get_proxy_session(segment_url, **session_kwargs)
             if client_range:
                 headers["Range"] = client_range
             elif is_init and init_range:
@@ -371,7 +383,10 @@ class HLSProxyDashMixin:
                 logger.debug("Using direct session for AES key request (forced)")
             else:
                 session, proxy_used = await self._get_proxy_session(
-                    key_url, bypass_warp=bypass_warp, forced_proxy=forced_proxy
+                    key_url,
+                    bypass_warp=bypass_warp,
+                    forced_proxy=forced_proxy,
+                    session_key=request.query.get("stream_key"),
                 )
                 session_need_close = proxy_used is not None
                 if proxy_used:
@@ -493,7 +508,12 @@ class HLSProxyDashMixin:
                                 )
                                 fallback_session = None
                                 try:
-                                    fallback_session, _ = await self._get_proxy_session(key_url, bypass_warp=bypass_warp, forced_proxy=new_proxy)
+                                    fallback_session, _ = await self._get_proxy_session(
+                                        key_url,
+                                        bypass_warp=bypass_warp,
+                                        forced_proxy=new_proxy,
+                                        session_key=request.query.get("stream_key"),
+                                    )
                                     async with fallback_session.get(key_url, headers=headers, ssl=not disable_ssl, allow_redirects=False, timeout=10) as rot_resp:
                                         if rot_resp.status in (200, 206):
                                             key_data = await rot_resp.read()
@@ -573,7 +593,12 @@ class HLSProxyDashMixin:
                         )
                         fallback_session = None
                         try:
-                            fallback_session, _ = await self._get_proxy_session(key_url, bypass_warp=bypass_warp, forced_proxy=new_proxy)
+                            fallback_session, _ = await self._get_proxy_session(
+                                key_url,
+                                bypass_warp=bypass_warp,
+                                forced_proxy=new_proxy,
+                                session_key=request.query.get("stream_key"),
+                            )
                             async with fallback_session.get(key_url, headers=headers, ssl=not disable_ssl, allow_redirects=False, timeout=10) as rot_resp:
                                 if rot_resp.status in (200, 206):
                                     key_data = await rot_resp.read()
